@@ -28,7 +28,7 @@ class OLHS_Dataset(Dataset):
     def __init__(self, data: pd.DataFrame) -> None:
         self.targets = data["Label"].values
         self.llm_preds = data["Pred"].values
-        self.time_cost = data["Time"].values
+        self.tokens = data["Token"].values
         self.posts_features = []
         for features in data["Feature"].values:
             features = torch.from_numpy(features).float()
@@ -39,8 +39,8 @@ class OLHS_Dataset(Dataset):
     def __getitem__(self, index: int):
         target, llm_pred = self.targets[index], self.llm_preds[index]
         post_features = self.posts_features[index]
-        time_cost = self.time_cost[index]
-        return post_features, target, llm_pred, time_cost
+        token = self.tokens[index]
+        return post_features, target, llm_pred, token
 
     def __len__(self) -> int:
         return len(self.posts_features)
@@ -52,8 +52,11 @@ class OLHS_3_Split_Dataloader:
         self.test_batch_size = test_batch_size
         self.seed = seed
 
+        dataset = []
         with open(OLHS_WITH_PREDS_PATH, 'r') as file:
-            dataset = json.load(file)
+            for idx, line in enumerate(file):
+                sample = json.loads(line.strip())
+                dataset.append(sample)
 
         print("Loading Glove Model")
         f = open(PATH_GLOVE_MODEL, 'r', errors='ignore')
@@ -67,7 +70,7 @@ class OLHS_3_Split_Dataloader:
         targets = []
         labels = []
         preds = []
-        times = []
+        tokens = []
         # 打印读取的列表
         for data in dataset:
             features = []
@@ -81,7 +84,7 @@ class OLHS_3_Split_Dataloader:
 
             targets.append(features)
             labels.append(data["Label"])
-            times.append(data["Time"])
+            tokens.append(data["Completion_tokens"] + data["Prompt_tokens"])
             if (random_zero_or_one(1) == 0):
                 preds.append(data["Preds"])
             else:
@@ -92,17 +95,17 @@ class OLHS_3_Split_Dataloader:
         train_labels = labels[:int(data_len * 0.8)]
         train_features = targets[:int(data_len * 0.8)]
         train_preds = preds[:int(data_len * 0.8)]
-        train_time_cost = times[:int(data_len * 0.8)]
+        train_tokens = tokens[:int(data_len * 0.8)]
 
         test_labels = labels[int(data_len * 0.8):]
         test_features = targets[int(data_len * 0.8):]
         test_preds = preds[int(data_len * 0.8):]
-        test_time_cost = times[int(data_len * 0.8):]
+        test_tokens = tokens[int(data_len * 0.8):]
 
         train_df = pd.DataFrame(
-            {"Label": train_labels, "Feature": train_features, "Pred": train_preds, "Time": train_time_cost})
+            {"Label": train_labels, "Feature": train_features, "Pred": train_preds, "Token": train_tokens})
         test_df = pd.DataFrame(
-            {"Label": test_labels, "Feature": test_features, "Pred": test_preds, "Time": test_time_cost})
+            {"Label": test_labels, "Feature": test_features, "Pred": test_preds, "Token": test_tokens})
 
         self.trainset = OLHS_Dataset(train_df)
         self.testset = OLHS_Dataset(test_df)
@@ -264,16 +267,15 @@ def train_allocation(allocation_input_list, h_list, allocation_system, allocatio
                 allocation_system_scheduler.step()
 
 def evaluate_allocation(epoch, classifier, allocation_system, test_loader):
-    start_time = time.time()
     allocation_system.eval()
     classifier.eval()
     system_decisions = []
     targets = []
     sum0 = 0
     sum1 = 0
-    llm_pred_time = torch.tensor([0]).float()
+    llm_token = torch.tensor([0]).float()
     with torch.no_grad():
-        for i, (batch_features, batch_targets, batch_preds, time_cost) in enumerate(test_loader):
+        for i, (batch_features, batch_targets, batch_preds, token) in enumerate(test_loader):
             batch_features = batch_features.to(device)
 
             batch_allocation_system_outputs = allocation_system(batch_features)
@@ -282,7 +284,7 @@ def evaluate_allocation(epoch, classifier, allocation_system, test_loader):
             if batch_system_decisions == 1:
                 sum1 += 1
                 system_decisions.append(batch_preds)
-                llm_pred_time += time_cost
+                llm_token += token
             else:
                 sum0 += 1
                 batch_classifier_outputs = classifier(batch_features)
@@ -291,17 +293,15 @@ def evaluate_allocation(epoch, classifier, allocation_system, test_loader):
         system_decisions = torch.cat(system_decisions, dim=0)
         targets = torch.cat(targets, dim=0)
     system_accuracy = get_accuracy(system_decisions, targets)
-    end_time = time.time()
-    time_cost = end_time - start_time + llm_pred_time.item()
+    token_consumption = llm_token.item()
     print(f"choose llm: {sum1}, choose classifier: {sum0}")
-    return system_accuracy, time_cost, sum0, sum1
+    return system_accuracy, token_consumption, sum0, sum1
 
 def evaluate_classifier(epoch, classifier, test_loader):
     classifier.eval()
     classifier_decisions = []
     targets = []
     with torch.no_grad():
-        start_time = time.time()
         for batch_features, batch_targets, batch_preds, batch_time_cost in test_loader:
             batch_classifier_outputs = classifier(batch_features)
             batch_classifier_decisions = np.argmax(batch_classifier_outputs.to("cpu"), 1)
@@ -311,22 +311,21 @@ def evaluate_classifier(epoch, classifier, test_loader):
         targets = torch.cat(targets, dim=0)
         classifier_accuracy = get_accuracy(classifier_decisions, targets)
         end_time = time.time()
-        classifier_time_cost = end_time - start_time
-    return classifier_accuracy, classifier_time_cost
+    return classifier_accuracy, 0
 
 def evaluate_llm(test_loader):
     llm_decisions = []
     targets = []
-    llm_time_cost = torch.tensor([0]).float()
+    llm_token = torch.tensor([0]).float()
     with torch.no_grad():
-        for batch_features, batch_targets, batch_preds, batch_time_cost in test_loader:
-            llm_time_cost += batch_time_cost
+        for batch_features, batch_targets, batch_preds, batch_token in test_loader:
+            llm_token += batch_token
             targets.append(batch_targets)
             llm_decisions.append(batch_preds)
         targets = torch.cat(targets, dim=0)
         llm_decisions = torch.cat(llm_decisions, dim=0)
         llm_accuracy = get_accuracy(llm_decisions, targets)
-    return llm_accuracy, llm_time_cost.item()
+    return llm_accuracy, llm_token.item()
 
 
 def my_approach(train_loader, test_loader):
@@ -343,27 +342,27 @@ def my_approach(train_loader, test_loader):
     allocation_system_loss_fn = nn.CrossEntropyLoss()
 
     best_accuracy = 0
-    best_time_cost = 1e5
+    best_token_consumption = 1e9
 
     for epoch in range(1, EPOCHS + 1):
         print("current epoch:", epoch)
         allocation_input_list, h_list = train_classifier(epoch, classifier, train_loader, classifier_optimizer, classifier_scheduler, classifier_loss_fn)
         train_allocation(allocation_input_list, h_list, allocation_system, allocation_system_optimizer,
                          allocation_system_loss_fn, allocation_system_scheduler)
-        system_accuracy, system_time_cost, sum0, sum1 = evaluate_allocation(epoch, classifier, allocation_system, test_loader)
-        print("system_accuracy:", system_accuracy, "system_time_cost", system_time_cost)
-        classifier_accuracy, classifier_time_cost = evaluate_classifier(epoch, classifier, test_loader)
-        print("classifier_accuracy:", classifier_accuracy, "classifier_time_cost:", classifier_time_cost)
-        llm_accuracy, llm_time_cost = evaluate_llm(test_loader)
-        print("llm_accuracy:", llm_accuracy, "llm_time_cost:", llm_time_cost)
+        system_accuracy, system_token_consumption, sum0, sum1 = evaluate_allocation(epoch, classifier, allocation_system, test_loader)
+        print("system_accuracy:", system_accuracy, "system_token_consumption:", system_token_consumption)
+        classifier_accuracy, classifier_token_consumption = evaluate_classifier(epoch, classifier, test_loader)
+        print("classifier_accuracy:", classifier_accuracy, "classifier_token_consumption:", classifier_token_consumption)
+        llm_accuracy, llm_token_consumption = evaluate_llm(test_loader)
+        print("llm_accuracy:", llm_accuracy, "llm_token_consumption:", llm_token_consumption)
 
         if system_accuracy > best_accuracy:
             best_accuracy = system_accuracy
-            best_accuracy_result = [system_accuracy, system_time_cost, sum0, sum1]
-        if system_time_cost < best_time_cost:
-            best_time_cost = system_time_cost
-            best_time_cost_result = [system_accuracy, system_time_cost, sum0, sum1]
-    return best_accuracy_result, best_time_cost_result
+            best_accuracy_result = [system_accuracy, system_token_consumption, sum0, sum1]
+        if system_token_consumption < best_token_consumption:
+            best_token_consumption = system_token_consumption
+            best_token_consumption_result = [system_accuracy, system_token_consumption, sum0, sum1]
+    return best_accuracy_result, best_token_consumption_result
 
 
 def C_E_Team_train_one_epoch(epoch, classifier, allocation_system, train_loader, optimizer, scheduler, loss_fn):
@@ -441,24 +440,24 @@ def C_E_Team(train_loader, test_loader):
     loss_fn = CET_loss
 
     best_accuracy = 0
-    best_time_cost = 1e5
+    best_token_consumption = 1e9
     for epoch in range(1, EPOCHS + 1):
         print("current epoch:", epoch)
         C_E_Team_train_one_epoch(epoch, classifier, allocation_system, train_loader, optimizer, scheduler, loss_fn)
-        system_accuracy, system_time_cost, sum0, sum1 = evaluate_allocation(epoch, classifier, allocation_system, test_loader)
-        print("system_accuracy:", system_accuracy, "system_time_cost", system_time_cost)
-        classifier_accuracy, classifier_time_cost = evaluate_classifier(epoch, classifier, test_loader)
-        print("classifier_accuracy:", classifier_accuracy, "classifier_time_cost:", classifier_time_cost)
-        llm_accuracy, llm_time_cost = evaluate_llm(test_loader)
-        print("llm_accuracy:", llm_accuracy, "llm_time_cost:", llm_time_cost)
+        system_accuracy, system_token_consumption, sum0, sum1 = evaluate_allocation(epoch, classifier, allocation_system, test_loader)
+        print("system_accuracy:", system_accuracy, "system_token_consumption", system_token_consumption)
+        classifier_accuracy, classifier_token_consumption = evaluate_classifier(epoch, classifier, test_loader)
+        print("classifier_accuracy:", classifier_accuracy, "classifier_token_consumption:", classifier_token_consumption)
+        llm_accuracy, llm_token_consumption = evaluate_llm(test_loader)
+        print("llm_accuracy:", llm_accuracy, "llm_token_consumption:", llm_token_consumption)
 
         if system_accuracy > best_accuracy:
             best_accuracy = system_accuracy
-            best_accuracy_result = [system_accuracy, system_time_cost, sum0, sum1]
-        if system_time_cost < best_time_cost:
-            best_time_cost = system_time_cost
-            best_time_cost_result = [system_accuracy, system_time_cost, sum0, sum1]
-    return best_accuracy_result, best_time_cost_result
+            best_accuracy_result = [system_accuracy, system_token_consumption, sum0, sum1]
+        if system_token_consumption < best_token_consumption:
+            best_token_consumption = system_token_consumption
+            best_token_consumption_result = [system_accuracy, system_token_consumption, sum0, sum1]
+    return best_accuracy_result, best_token_consumption_result
 
 def classifier_baseline(train_loader, test_loader):
     classifier = Network(output_size=NUM_CLASSES).to(device)
@@ -467,7 +466,6 @@ def classifier_baseline(train_loader, test_loader):
     classifier_loss_fn = nn.CrossEntropyLoss()
 
     best_accuracy = 0
-    best_time_cost = 1e5
     for epoch in range(1, EPOCHS + 1):
         classifier.train()
         for i, (batch_features, batch_targets, batch_preds, _) in enumerate(train_loader):
@@ -481,17 +479,14 @@ def classifier_baseline(train_loader, test_loader):
             classifier_optimizer.step()
             if USE_LR_SCHEDULER:
                 classifier_scheduler.step()
-        classifier_accuracy, classifier_time_cost = evaluate_classifier(epoch, classifier, test_loader)
+        classifier_accuracy, _ = evaluate_classifier(epoch, classifier, test_loader)
         best_accuracy = max(best_accuracy, classifier_accuracy)
-        best_time_cost = min(best_time_cost, classifier_time_cost)
-    return best_accuracy, best_time_cost
-
-
+    return best_accuracy, 0
 
 if __name__ == '__main__':
 
     PATH_GLOVE_MODEL = '../../data/glove.6B.100d.txt'  #你需要将此路径替换为实际GloVe文件所在的路径
-    OLHS_WITH_PREDS_PATH = '../../OLHS_task/OLHS_data_ChatGLM3.json' #你需要将此路径替换为数据文件所在的路径
+    OLHS_WITH_PREDS_PATH = '../../OLHS_task/OLHS_data_Online_Qwen.json' #你需要将此路径替换为数据文件所在的路径
     SEED = 67
     EXPERIMENT_EPOCH = 3
     TRAIN_BATCH_SIZE = 128
@@ -501,7 +496,7 @@ if __name__ == '__main__':
     DROPOUT = 0.00
     NUM_HIDDEN_UNITS = 50
     LR = 5e-3
-    EPOCHS = 5
+    EPOCHS = 2
     ALLOCATION_EPOCHS = 5
     USE_LR_SCHEDULER = True
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -510,63 +505,62 @@ if __name__ == '__main__':
     train_loader, test_loader = ohs_dl.get_data_loader()
 
     best_accuracy_result_list = []
-    best_time_cost_result_list = []
+    best_token_consumption_result_list = []
     for i in range(EXPERIMENT_EPOCH):
         setup_seed(SEED + i)
-        best_accuracy_result, best_time_cost_result = my_approach(train_loader, test_loader)
+        best_accuracy_result, best_token_consumption_result = my_approach(train_loader, test_loader)
         best_accuracy_result_list.append(best_accuracy_result)
-        best_time_cost_result_list.append(best_time_cost_result)
+        best_token_consumption_result_list.append(best_token_consumption_result)
 
     stdev_best_accuracy_result = [statistics.stdev(data) for data in zip(*best_accuracy_result_list)]
     avg_best_accuracy_result = [sum(data) / EXPERIMENT_EPOCH for data in zip(*best_accuracy_result_list)]
-    stdev_best_time_cost_result = [statistics.stdev(data) for data in zip(*best_time_cost_result_list)]
-    avg_best_time_cost_result = [sum(data) / EXPERIMENT_EPOCH for data in zip(*best_time_cost_result_list)]
+    stdev_best_token_consumption_result = [statistics.stdev(data) for data in zip(*best_token_consumption_result_list)]
+    avg_best_token_consumption_result = [sum(data) / EXPERIMENT_EPOCH for data in zip(*best_token_consumption_result_list)]
 
 
     CET_best_accuracy_result_list = []
-    CET_best_time_cost_result_list = []
+    CET_best_token_consumption_result_list = []
     for i in range(EXPERIMENT_EPOCH):
         setup_seed(SEED + i)
         CET_best_accuracy_result, CET_best_time_cost_result = C_E_Team(train_loader, test_loader)
         CET_best_accuracy_result_list.append(CET_best_accuracy_result)
-        CET_best_time_cost_result_list.append(CET_best_time_cost_result)
+        CET_best_token_consumption_result_list.append(CET_best_time_cost_result)
 
     CET_stdev_best_accuracy_result = [statistics.stdev(data) for data in zip(*CET_best_accuracy_result_list)]
     CET_avg_best_accuracy_result = [sum(data) / EXPERIMENT_EPOCH for data in zip(*CET_best_accuracy_result_list)]
-    CET_stdev_best_time_cost_result = [statistics.stdev(data) for data in zip(*CET_best_time_cost_result_list)]
-    CET_avg_best_time_cost_result = [sum(data) / EXPERIMENT_EPOCH for data in zip(*CET_best_time_cost_result_list)]
+    CET_stdev_best_token_consumption_result = [statistics.stdev(data) for data in zip(*CET_best_token_consumption_result_list)]
+    CET_avg_best_token_consumption_result = [sum(data) / EXPERIMENT_EPOCH for data in zip(*CET_best_token_consumption_result_list)]
 
 
     classifier_accuracy_list = []
-    classifier_time_cost_result_list = []
+    classifier_token_consumption_result_list = []
     for i in range(EXPERIMENT_EPOCH):
         setup_seed(SEED + i)
         accuracy, time_cost = classifier_baseline(train_loader, test_loader)
         classifier_accuracy_list.append(accuracy)
-        classifier_time_cost_result_list.append(time_cost)
+        classifier_token_consumption_result_list.append(time_cost)
 
     classifier_stdev_best_accuracy_result = statistics.stdev(classifier_accuracy_list)
     classifier_avg_best_accuracy_result = sum(classifier_accuracy_list) / EXPERIMENT_EPOCH
-    classifier_stdev_best_time_cost_result = statistics.stdev(classifier_time_cost_result_list)
-    classifier_avg_best_time_cost_result = sum(classifier_time_cost_result_list) / EXPERIMENT_EPOCH
+    classifier_stdev_best_token_consumption_result = statistics.stdev(classifier_token_consumption_result_list)
+    classifier_avg_best_token_consumption_result = sum(classifier_token_consumption_result_list) / EXPERIMENT_EPOCH
 
-    llm_accuracy, llm_time_cost = evaluate_llm(test_loader)
+    llm_accuracy, llm_token_consumption = evaluate_llm(test_loader)
 
 
     print("-------------------------------------------baseline--------------------------------------------")
-    print("llm_accuracy:", llm_accuracy, "llm_time_cost:", llm_time_cost)
-    print(f"nn accuracy : {classifier_avg_best_accuracy_result:>0.4f}({classifier_stdev_best_accuracy_result:>0.4f}), nn time cost : {classifier_avg_best_time_cost_result:>0.2f}({classifier_stdev_best_time_cost_result:>0.2f})\n")
+    print("llm_accuracy:", llm_accuracy, "llm token consumption:", llm_token_consumption)
+    print(f"nn accuracy : {classifier_avg_best_accuracy_result:>0.2f}({classifier_stdev_best_accuracy_result:>0.2f}), nn token consumption : {classifier_avg_best_token_consumption_result:>0.2f}({classifier_stdev_best_token_consumption_result:>0.2f})\n")
 
     print("------------------------------------------my approach------------------------------------------")
     print(f"best accuracy result : \n"
-          f"system accuracy : {avg_best_accuracy_result[0]:>0.4f}({stdev_best_accuracy_result[0]:>0.4f}), system time cost : {avg_best_accuracy_result[1]:>0.2f}({stdev_best_accuracy_result[1]:>0.2f}), system choose classifier/llm : {avg_best_accuracy_result[2]:>0.0f} / {avg_best_accuracy_result[3]:>0.0f}\n")
+          f"system accuracy : {avg_best_accuracy_result[0]:>0.2f}({stdev_best_accuracy_result[0]:>0.2f}), system token consumption : {avg_best_accuracy_result[1]:>0.2f}({stdev_best_accuracy_result[1]:>0.2f}), system choose classifier/llm : {avg_best_accuracy_result[2]:>0.0f} / {avg_best_accuracy_result[3]:>0.0f}\n")
 
-    print(f"best time cost result : \n"
-          f"system accuracy : {avg_best_time_cost_result[0]:>0.4f}({stdev_best_time_cost_result[0]:>0.4f}), system time cost : {avg_best_time_cost_result[1]:>0.2f}({stdev_best_time_cost_result[1]:>0.2f}), system choose classifier/llm : {avg_best_time_cost_result[2]:>0.0f} / {avg_best_time_cost_result[3]:>0.0f}\n")
+    print(f"best token consumption result : \n"
+          f"system accuracy : {avg_best_token_consumption_result[0]:>0.2f}({stdev_best_token_consumption_result[0]:>0.2f}), system token consumption : {avg_best_token_consumption_result[1]:>0.2f}({stdev_best_token_consumption_result[1]:>0.2f}), system choose classifier/llm : {avg_best_token_consumption_result[2]:>0.0f} / {avg_best_token_consumption_result[3]:>0.0f}\n")
 
     print("-------------------------------------------C_E_Team--------------------------------------------")
     print(f"best accuracy result : \n"
-          f"system accuracy : {CET_avg_best_accuracy_result[0]:>0.4f}({CET_stdev_best_accuracy_result[0]:>0.4f}), system time cost : {CET_avg_best_accuracy_result[1]:>0.2f}({CET_stdev_best_accuracy_result[1]:>0.2f}), system choose classifier/llm : {CET_avg_best_accuracy_result[2]:>0.0f} / {CET_avg_best_accuracy_result[3]:>0.0f}\n")
-    print(f"best time cost result : \n"
-          f"system accuracy : {CET_avg_best_time_cost_result[0]:>0.4f}({CET_stdev_best_time_cost_result[0]:>0.4f}), system time cost : {CET_avg_best_time_cost_result[1]:>0.2f}({CET_stdev_best_time_cost_result[1]:>0.2f}), system choose classifier/llm : {CET_avg_best_time_cost_result[2]:>0.0f} / {CET_avg_best_time_cost_result[3]:>0.0f}\n")
-
+          f"system accuracy : {CET_avg_best_accuracy_result[0]:>0.2f}({CET_stdev_best_accuracy_result[0]:>0.2f}), system token consumption : {CET_avg_best_accuracy_result[1]:>0.2f}({CET_stdev_best_accuracy_result[1]:>0.2f}), system choose classifier/llm : {CET_avg_best_accuracy_result[2]:>0.0f} / {CET_avg_best_accuracy_result[3]:>0.0f}\n")
+    print(f"best token consumption result : \n"
+          f"system accuracy : {CET_avg_best_token_consumption_result[0]:>0.2f}({CET_stdev_best_token_consumption_result[0]:>0.2f}), system token consumption : {CET_avg_best_token_consumption_result[1]:>0.2f}({CET_stdev_best_token_consumption_result[1]:>0.2f}), system choose classifier/llm : {CET_avg_best_token_consumption_result[2]:>0.0f} / {CET_avg_best_token_consumption_result[3]:>0.0f}\n")
