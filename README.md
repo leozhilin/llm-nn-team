@@ -24,11 +24,11 @@ download and unzip glove.6B.100d.txt from Stanford University
 download labelled_data.npy from Github Repo of Towards Unbiased and Accurate Deferral to Multiple Experts by Keswani et al. (2021)
 
 ```
-#download from https://github.com/vijaykeswani/Deferral-To-Multiple Experts/blob/3aa1f621991cb9d7823757d68c178870b686da62/output/labelled_data.npy
+#download from https://github.com/vijaykeswani/Deferral-To-Multiple-Experts/blob/main/output/labelled_data.npy
 ```
 
 ```
-pip install pandasp
+pip install pandas
 pip install sklearn
 ```
 
